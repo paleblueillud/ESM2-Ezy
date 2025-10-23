@@ -114,7 +114,7 @@ if __name__ == '__main__':
                 correct_test = 0
                 predict_test = {}
                 predict_really_test = {}
-                ground_truth_test = {0:len(train_dataset.negative_dataset),1:len(train_dataset.positive_dataset)}
+                ground_truth_test = {0:len(test_dataset.negative_dataset),1:len(test_dataset.positive_dataset)}
                 for m, test in enumerate(tqdm(test_dataloader)):
                     data_test, label_test = test
                     if model.device is not None:
