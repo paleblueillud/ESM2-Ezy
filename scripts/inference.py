@@ -19,6 +19,7 @@ def parse_args():
     parser.add_argument('--output_path', type=str)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--dtype', type=str, default="float32", choices=["float32", "float16", "bfloat16"])
+    parser.add_argument('--threshold', type=float, default=0.4)
     args = parser.parse_args()
     return args
 
@@ -32,6 +33,7 @@ if __name__ == '__main__':
     output_path = args.output_path
     batch_size = args.batch_size
     dtype_name = args.dtype
+    threshold = float(args.threshold)
     model_dtype = resolve_dtype(dtype_name)
 
     if device.type == "cpu" and model_dtype != torch.float32:
@@ -60,8 +62,8 @@ if __name__ == '__main__':
         for content in tqdm(inference_dataloader, total=len(inference_dataloader)):
             with autocast_context():
                 last_result = model(content)
-            pred = torch.argmax(last_result, dim=1)
-            mask = (pred == 1).cpu().tolist()
+            probs = torch.softmax(last_result, dim=1)[:, 1]
+            mask = (probs >= threshold).cpu().tolist()
             inference_list.extend([c for m, c in zip(mask, content) if m])
 
     os.makedirs(output_path, exist_ok=True)

@@ -26,6 +26,13 @@ def parse_args():
     # Add Early Stop parameter with default=None to indicate disabled
     parser.add_argument('--patience', type=int, default=None, help='Number of epochs to wait before early stop. If not provided, early stop is disabled.')
     parser.add_argument('--dtype', type=str, default="float32", choices=["float32", "float16", "bfloat16"])
+    parser.add_argument('--pos-weight', type=float, default=2.0, dest="pos_weight")
+    parser.add_argument('--threshold', type=float, default=0.4)
+    parser.add_argument('--grad-accum-steps', type=int, default=8, dest="grad_accum_steps")
+    parser.add_argument('--lr-backbone', type=float, default=1e-5, dest="lr_backbone")
+    parser.add_argument('--lr-head', type=float, default=1e-4, dest="lr_head")
+    parser.add_argument('--weight-decay', type=float, default=0.01, dest="weight_decay")
+    parser.add_argument('--early-stop-metric', type=str, default="recall", choices=["recall", "f1", "accuracy"])
     args = parser.parse_args()
     return args
 
@@ -44,7 +51,17 @@ if __name__ == '__main__':
     total_save_path = args.save_path
     patience = args.patience  # None if not provided
     dtype_name = args.dtype
+    pos_weight = float(args.pos_weight)
+    threshold = float(args.threshold)
+    grad_accum_steps = int(args.grad_accum_steps)
+    lr_backbone = float(args.lr_backbone)
+    lr_head = float(args.lr_head)
+    weight_decay = float(args.weight_decay)
+    early_stop_metric = args.early_stop_metric
     model_dtype = resolve_dtype(dtype_name)
+
+    if grad_accum_steps < 1:
+        raise ValueError("--grad-accum-steps must be >= 1")
 
     if device.type == "cpu" and model_dtype != torch.float32:
         print("Warning: non-float32 dtype on CPU is not supported reliably. Falling back to float32.")
@@ -57,7 +74,10 @@ if __name__ == '__main__':
         return torch.autocast(device_type="cuda", dtype=model_dtype) if use_amp else contextlib.nullcontext()
     
     # ==================== Early Stop Initialization ====================
+    best_metric = -1.0
     best_acc = 0.0           # Record the best accuracy
+    best_recall = 0.0
+    best_f1 = 0.0
     best_epoch = -1          # Record the epoch where best accuracy occurred
     wait_counter = 0         # Counter for no improvement
     if patience is not None:
@@ -80,8 +100,24 @@ if __name__ == '__main__':
             print(name)
     model = model.to(device=device, dtype=model_dtype)
     
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-5)
+    weight = torch.tensor([1.0, pos_weight], device=device)
+    criterion = torch.nn.CrossEntropyLoss(weight=weight)
+
+    head_params = []
+    backbone_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("dnn"):
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+    optimizer = torch.optim.Adam(
+        [
+            {"params": backbone_params, "lr": lr_backbone, "weight_decay": weight_decay},
+            {"params": head_params, "lr": lr_head, "weight_decay": weight_decay},
+        ]
+    )
     # data
     train_dataset = TrainingDataset(positive_path=train_positive_data, negative_path=train_negative_data, dynamic_negative_sampling=True)
     train_dataloader = DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True,
@@ -103,31 +139,32 @@ if __name__ == '__main__':
         # train
         model.train()
         print(len(train_dataloader))
+        optimizer.zero_grad()
         for i, item in enumerate(train_dataloader):
             content, label = item
             label = label.to(device)
             with autocast_context():
                 last_result = model(content)
-                loss = criterion(last_result, label)
+                loss = criterion(last_result, label) / grad_accum_steps
             print("epoch: {} \t iteration : {} \t Loss: {} \t lr: {}".format(epoch, i, loss.item(),
                                                                              optimizer.param_groups[0]['lr']), flush=True)
             # break
-            optimizer.zero_grad()
             if scaler is not None:
                 scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 loss.backward()
-                optimizer.step()
+            if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_dataloader):
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
             if i % (len(train_dataloader)//2) == 0:
                 # eval
                 model.eval()
                 total_test = 0
-                correct_test = 0
-                predict_test = {}
-                predict_really_test = {}
-                ground_truth_test = {0:len(test_dataset.negative_dataset),1:len(test_dataset.positive_dataset)}
+                tp = fp = tn = fn = 0
                 for m, test in enumerate(tqdm(test_dataloader)):
                     data_test, label_test = test
                     label_test = label_test.to(device)
@@ -136,56 +173,47 @@ if __name__ == '__main__':
                         with autocast_context():
                             last_result_test = model(data_test)
 
-                    # label
-                    predicted = torch.argmax(last_result_test.data, dim=1)
-
-                    predict_label = predicted.cpu().numpy()
-                    really_label = label_test.cpu().numpy()
-
-                    for k in range(len(predict_label)):
-                        if predict_label[k] not in predict_test:
-                            predict_test[predict_label[k]] = 1
-                        else:
-                            predict_test[predict_label[k]] += 1
-
-                        if predict_label[k] == really_label[k]:
-                            if predict_label[k] not in predict_really_test:
-                                predict_really_test[predict_label[k]] = 1
-                            else:
-                                predict_really_test[predict_label[k]] += 1
-
+                    probs = torch.softmax(last_result_test, dim=1)[:, 1]
+                    predicted = (probs >= threshold).long()
+                    tp += ((predicted == 1) & (label_test == 1)).sum().item()
+                    fp += ((predicted == 1) & (label_test == 0)).sum().item()
+                    tn += ((predicted == 0) & (label_test == 0)).sum().item()
+                    fn += ((predicted == 0) & (label_test == 1)).sum().item()
                     total_test += label_test.size(0)
-                    correct_test += (predicted == label_test).sum().cpu().item()
-
-
-                out = ""
-                for m in range(len(ground_truth_test)):
-                    if m in predict_test and m in predict_really_test:
-                        out = out + "Category_" + str(m) + "\t" + "predict_really " + str(predict_really_test[m]) + \
-                                "\t" + "predict " + str(predict_test[m]) + "\t" + "     Precision " + str(
-                                predict_really_test[m] / predict_test[m]) + "\t" \
-                                + "recall" + str(predict_really_test[m] / ground_truth_test[m])[:5] + "\n"
                 
-                current_acc = correct_test / total_test
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+                current_acc = (tp + tn) / total_test if total_test > 0 else 0.0
                 Test_Acc.append(current_acc)
-                print("Epoch_item: {} \t\t Correct_num: {} \t\t total: {} \t\t Accuracy on test data: {} \n".format(
-                    epoch, correct_test, total_test, current_acc))
-                print(out)
+                print(
+                    "Epoch_item: {} \t\t total: {} \t\t Accuracy: {:.6f} \t Precision: {:.6f} \t Recall: {:.6f} \t F1: {:.6f} \n".format(
+                        epoch, total_test, current_acc, precision, recall, f1
+                    )
+                )
                 result_dir = f"{total_save_path}/result"
                 if not os.path.exists(result_dir):
                     os.makedirs(result_dir)
                 with open(f"{result_dir}/dnn_result_test_lastlayer{last_layers}.txt", "a+", encoding="utf-8") as output:
                     output.write(
-                            "Epoch_item: {} \t\t Correct_num: {} \t\t total: {} \t\t Accuracy on test data: {} \n".format(
-                                epoch, correct_test, total_test, current_acc))
-                    output.write(out)
+                            "Epoch_item: {} \t\t total: {} \t\t Accuracy: {:.6f} \t Precision: {:.6f} \t Recall: {:.6f} \t F1: {:.6f} \t Threshold: {:.3f}\n".format(
+                                epoch, total_test, current_acc, precision, recall, f1, threshold))
+                    output.write(f"TP {tp}\tFP {fp}\tTN {tn}\tFN {fn}\n")
 
                 with open(f"{result_dir}/dnn_result_test_ACC_lastlayer{last_layers}.txt", "a+", encoding="utf-8") as output:
                     output.write(str(Test_Acc) + "\n")
                     
-                improved = current_acc > best_acc
+                metric_value = {
+                    "accuracy": current_acc,
+                    "recall": recall,
+                    "f1": f1,
+                }[early_stop_metric]
+                improved = metric_value > best_metric
                 if improved:
+                    best_metric = metric_value
                     best_acc = current_acc
+                    best_recall = recall
+                    best_f1 = f1
                     best_epoch = epoch
                     wait_counter = 0
                     best_path = os.path.join(ckpt_dir, "best.pt")
@@ -207,10 +235,13 @@ if __name__ == '__main__':
                         },
                         best_path,
                     )
-                    print(f"Test accuracy improved to {best_acc:.4f} at epoch {best_epoch}")
+                    print(
+                        f"Test {early_stop_metric} improved to {metric_value:.4f} at epoch {best_epoch} "
+                        f"(acc {current_acc:.4f}, recall {recall:.4f}, f1 {f1:.4f})"
+                    )
                 elif patience is not None:
                     wait_counter += 1
-                    print(f"Test accuracy not improved. Patience: {wait_counter}/{patience}")
+                    print(f"Test {early_stop_metric} not improved. Patience: {wait_counter}/{patience}")
                     
                 model.train()
         
@@ -236,6 +267,12 @@ if __name__ == '__main__':
         
     # ==================== Final Report ====================
     if patience is not None:
-        print(f"\nTraining completed with early stop! Best test accuracy: {best_acc:.4f} at epoch {best_epoch}")
+        print(
+            f"\nTraining completed with early stop! Best {early_stop_metric}: {best_metric:.4f} "
+            f"(acc {best_acc:.4f}, recall {best_recall:.4f}, f1 {best_f1:.4f}) at epoch {best_epoch}"
+        )
     else:
-        print("\nTraining completed without early stop")
+        print(
+            f"\nTraining completed without early stop. Best {early_stop_metric}: {best_metric:.4f} "
+            f"(acc {best_acc:.4f}, recall {best_recall:.4f}, f1 {best_f1:.4f}) at epoch {best_epoch}"
+        )

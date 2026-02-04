@@ -56,6 +56,23 @@ python scripts/train.py \
 
 **CUDA/HPC note:** run via your scheduler and set `CUDA_VISIBLE_DEVICES` externally. For typical GPU memory limits, prefer `--dtype bfloat16` or `--dtype float16` (default is `float32`).
 
+**High-recall recipe (single A40):**
+
+```
+python scripts/train.py \
+  --train_positive_data data/train/train_positive.fa \
+  --train_negative_data data/train/train_negative.fa \
+  --test_positive_data data/train/test_positive.fa \
+  --test_negative_data data/train/test_negative.fa \
+  --model_path esm2_t36_3B_UR50D \
+  --dtype bfloat16 \
+  --batch_size 1 \
+  --grad-accum-steps 8 \
+  --last_layers 2 \
+  --pos-weight 2.0 \
+  --threshold 0.4
+```
+
 ## inference
 
 1. inference from uniref50 database:
@@ -66,7 +83,8 @@ python scripts/inference.py \
   --checkpoint_path ckpt/dnn_model_lastlayer1/best.pt \
   --inference_data data/inference/uniref50.fasta \
   --output_path data/retrieval \
-  --dtype float32
+  --dtype float32 \
+  --threshold 0.4
 ```
 
 ## Search
