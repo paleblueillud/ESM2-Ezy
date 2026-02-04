@@ -1,1 +1,1 @@
-from .esm_model import LaccaseModel
+from .esm_model import LaccaseModel, resolve_dtype

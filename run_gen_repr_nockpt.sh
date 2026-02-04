@@ -1,3 +1,14 @@
-source /zhouxibin/anaconda3/bin/activate framework
-# python scripts/search.py -m /zhouxibin/models/esm1b_t33_650M_UR50S.pt -ckpt ckpt/model_laccase.pkl -p data/MCO_retrieval/positive_set.fasta -n data/MCO_retrieval/negative_set.fasta -s data/MCO_retrieval/reprs -b 128
-torchrun --nproc_per_node=$1 --nnodes=1 scripts/generate_representations.py -m /zhouxibin/models/esm1b_t33_650M_UR50S.pt -p data/MCO_retrieval/new_positive_set.fasta -n data/MCO_retrieval/new_negative_set.fasta -s data/MCO_retrieval/reprs -b 32
+#!/usr/bin/env bash
+set -euo pipefail
+
+NPROC=${1:-1}
+
+# For multi-node runs, launch with your scheduler's torchrun wrapper and set the appropriate env vars.
+torchrun --nproc_per_node="${NPROC}" --nnodes=1 \
+  scripts/generate_representations.py \
+  -m esm2_t36_3B_UR50D \
+  -p data/MCO_retrieval/new_positive_set.fasta \
+  -n data/MCO_retrieval/new_negative_set.fasta \
+  -s data/MCO_retrieval/reprs \
+  -b 1 \
+  --dtype float32

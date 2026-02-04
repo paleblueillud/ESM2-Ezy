@@ -3,29 +3,29 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import pickle as pkl
 
-from model.esm_model import LaccaseModel
-from dataset.retrieval_dataset import RetrievalDataset
-from torch.utils.data import DataLoader, DistributedSampler
+import contextlib
 import torch
+from torch.utils.data import DataLoader, DistributedSampler
 import torch.distributed as dist
 import numpy as np
 from tqdm import tqdm
-import faiss
-import mkl
-mkl.get_max_threads()
+
+from model import LaccaseModel, resolve_dtype
+from dataset.retrieval_dataset import RetrievalDataset
 
 def parse_args():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('-m', '--model_path', type=str, required=True)
+    parser.add_argument('-m', '--model_path', type=str, default="esm2_t36_3B_UR50D")
     parser.add_argument('-ckpt', '--checkpoint_path', type=str, default=None)
     parser.add_argument('-p', '--positive_path', type=str, required=True)
     parser.add_argument('-n', '--negative_path', type=str, required=True)
     parser.add_argument('-s', '--save_dir', type=str, default=None)
-    parser.add_argument('-b', '--batch_size', type=int, default=128)
+    parser.add_argument('-b', '--batch_size', type=int, default=1)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--shuffle', default=False, action='store_true')
     parser.add_argument('--save_every', type=int, default=1000)
+    parser.add_argument('--dtype', type=str, default="float32", choices=["float32", "float16", "bfloat16"])
     args = parser.parse_args()
     return args
 
@@ -40,7 +40,7 @@ def destroy_distributed():
 
 def setup(rank, world_size):
     dist.init_process_group(
-        backend='nccl',     # 'nccl'是GPU上推荐的后端，'gloo'可以用于CPU
+        backend='nccl' if torch.cuda.is_available() else 'gloo',     # 'nccl'是GPU上推荐的后端，'gloo'可以用于CPU
         init_method='env://',  # 使用环境变量来初始化进程组
         world_size=world_size,
         rank=rank
@@ -57,15 +57,31 @@ def main(args=None):
     num_workers = args.num_workers
     shuffle = args.shuffle
     save_every = args.save_every
+    dtype_name = args.dtype
+    model_dtype = resolve_dtype(dtype_name)
+
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
+        if model_dtype != torch.float32:
+            print("Warning: non-float32 dtype on CPU is not supported reliably. Falling back to float32.")
+            model_dtype = torch.float32
+            dtype_name = "float32"
+    use_amp = device.type == "cuda" and model_dtype != torch.float32
+
+    def autocast_context():
+        return torch.autocast(device_type="cuda", dtype=model_dtype) if use_amp else contextlib.nullcontext()
     
     # get rank and world size
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     
     # load model
-    torch.cuda.set_device(rank)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = LaccaseModel.from_pretrained(model_path, state_dict_path=checkpoint_path, device=device)
+    model = LaccaseModel.from_pretrained(model_path, state_dict_path=checkpoint_path, dtype=dtype_name)
+    model = model.to(device=device, dtype=model_dtype)
     model.eval()
     
     # load dataset
@@ -76,7 +92,8 @@ def main(args=None):
                                       num_workers=num_workers, 
                                       shuffle=shuffle,
                                       collate_fn=candidate_dataset.collate_fn,
-                                      sampler=sampler
+                                      sampler=sampler,
+                                      pin_memory=True
                                     )
     print(f"Rank {rank} has {len(candidate_dataloader)} candidate sequences", flush=True)
     
@@ -116,8 +133,9 @@ def main(args=None):
         names = model.get_names(sequences)
         total_names.extend(names)
         with torch.no_grad():
-            representations = model.get_representations(sequences)
-            total_reprs.append(representations.cpu().numpy())
+            with autocast_context():
+                representations = model.get_representations(sequences)
+            total_reprs.append(representations.detach().float().cpu().numpy())
             
         # save representations and labels every 1000 batches
         if (idx+1) % save_every == 0:

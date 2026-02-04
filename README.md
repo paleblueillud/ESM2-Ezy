@@ -6,7 +6,7 @@ To get dataset and model checkpoint, please refer to [![DOI](https://zenodo.org/
 
 Download the `data.zip` file and extract it to the `data` directory.
 
-Download the `ckpt.zip` file and extract it to the `ckpt` directory.
+Download the `ckpt.zip` file and extract it to the `ckpt` directory. **Note:** these checkpoints were trained with ESM-1b and are **not compatible** with ESM2. For ESM2, you must retrain.
 
 ### About the `train_positive.fa` and `train_negative.fa` files
 
@@ -28,30 +28,45 @@ git clone https://github.com/westlake-repl/ESM-Ezy.git
 conda env create -f environment.yml
 ```
 
-3. Download the pre-trained ESM-1b model:
+3. Train ESM-Ezy with ESM2 (default uses `esm2_t36_3B_UR50D` and will auto-download/cache the weights):
 
 ```
-wget https://dl.fbaipublicfiles.com/fair-esm/models/esm1b_t33_650M_UR50S.pt -O ckpt/esm1b_t33_650M_UR50S.pt
-wget https://dl.fbaipublicfiles.com/fair-esm/regression/esm1b_t33_650M_UR50S-contact-regression.pt -O ckpt/esm1b_t33_650M_UR50S-contact-regression.pt
-```
-
-4. Train ESM-Ezy:
-
-```
-python scripts/train.py --train_positive_data data/train/train_positive.fa --train_negative_data data/train/train_negative.fa --test_positive_data data/train/test_positive.fa --test_negative_data data/train/test_negative.fa --model_path ckpt/esm1b_t33_650M_UR50S.pt
+python scripts/train.py \
+  --train_positive_data data/train/train_positive.fa \
+  --train_negative_data data/train/train_negative.fa \
+  --test_positive_data data/train/test_positive.fa \
+  --test_negative_data data/train/test_negative.fa \
+  --model_path esm2_t36_3B_UR50D \
+  --dtype float32
 ```
 We also add early stopping to determine the training process is ready, you can try with:
 
 ```
-python scripts/train.py --train_positive_data data/train/train_positive.fa --train_negative_data data/train/train_negative.fa --test_positive_data data/train/test_positive.fa --test_negative_data data/train/test_negative.fa --model_path ckpt/esm1b_t33_650M_UR50S.pt --patience 10
+python scripts/train.py \
+  --train_positive_data data/train/train_positive.fa \
+  --train_negative_data data/train/train_negative.fa \
+  --test_positive_data data/train/test_positive.fa \
+  --test_negative_data data/train/test_negative.fa \
+  --model_path esm2_t36_3B_UR50D \
+  --dtype float32 \
+  --patience 10
 ```
+
+**Offline / HPC note:** if you already downloaded an ESM2 `.pt` file, pass the local path via `--model_path /path/to/esm2_t36_3B_UR50D.pt`.
+
+**CUDA/HPC note:** run via your scheduler and set `CUDA_VISIBLE_DEVICES` externally. For typical GPU memory limits, prefer `--dtype bfloat16` or `--dtype float16` (default is `float32`).
 
 ## inference
 
 1. inference from uniref50 database:
 
 ```
-python scripts/inference.py --model_path ckpt/esm1b_t33_650M_UR50S.pt --checkpoint_path ckpt/model_laccase.pkl --inference_data data/inference/uniref50.fasta  --output_path data/retrieval
+python scripts/inference.py \
+  --model_path esm2_t36_3B_UR50D \
+  --checkpoint_path ckpt/dnn_model_lastlayer1/best.pt \
+  --inference_data data/inference/uniref50.fasta \
+  --output_path data/retrieval \
+  --dtype float32
 ```
 
 ## Search
@@ -59,5 +74,11 @@ python scripts/inference.py --model_path ckpt/esm1b_t33_650M_UR50S.pt --checkpoi
 1. load the trained ESM-Ezy model and inference on the candidate sequences:
 
 ```
-python scripts/retrieval.py --model_path ckpt/esm1b_t33_650M_UR50S.pt --checkpoint_path ckpt/model_laccase.pkl --candidate_data data/retrieval/candidate.fa --seed_data data/retrieval/fitness.fa  --output_path data/retrieval
+python scripts/retrieval.py \
+  --model_path esm2_t36_3B_UR50D \
+  --checkpoint_path ckpt/dnn_model_lastlayer1/best.pt \
+  --candidate_data data/retrieval/candidate.fa \
+  --seed_data data/retrieval/fitness.fa \
+  --output_path data/retrieval \
+  --dtype float32
 ```

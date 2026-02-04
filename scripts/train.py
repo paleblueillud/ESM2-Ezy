@@ -1,20 +1,16 @@
 # -*-coding:utf-8-*-
-import numpy as np
-import esm
-import torch.nn as nn
+import argparse
+import contextlib
+import os
+import sys
+
 import torch
 from torch.utils.data.dataloader import DataLoader
-import os
-import csv
-# from apex import amp
-
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# from loading_Data import TrainData, TestData
-from model import LaccaseModel
-from dataset import TrainingDataset
-import argparse
 from tqdm import tqdm
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from model import LaccaseModel, resolve_dtype
+from dataset import TrainingDataset
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -22,19 +18,19 @@ def parse_args():
     parser.add_argument('--train_negative_data', type=str)
     parser.add_argument('--test_positive_data', type=str)
     parser.add_argument('--test_negative_data', type=str)
-    parser.add_argument('--model_path', type=str)
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--model_path', type=str, default="esm2_t36_3B_UR50D")
+    parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--epoch', type=int, default=1000)
     parser.add_argument('--last_layers', type=int, default=1)
     parser.add_argument('--save_path', type=str, default=".")
     # Add Early Stop parameter with default=None to indicate disabled
     parser.add_argument('--patience', type=int, default=None, help='Number of epochs to wait before early stop. If not provided, early stop is disabled.')
+    parser.add_argument('--dtype', type=str, default="float32", choices=["float32", "float16", "bfloat16"])
     args = parser.parse_args()
     return args
 
 if __name__ == '__main__':
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     args = parse_args()
     train_positive_data = args.train_positive_data
@@ -47,20 +43,31 @@ if __name__ == '__main__':
     last_layers = int(args.last_layers)
     total_save_path = args.save_path
     patience = args.patience  # None if not provided
+    dtype_name = args.dtype
+    model_dtype = resolve_dtype(dtype_name)
+
+    if device.type == "cpu" and model_dtype != torch.float32:
+        print("Warning: non-float32 dtype on CPU is not supported reliably. Falling back to float32.")
+        model_dtype = torch.float32
+        dtype_name = "float32"
+    use_amp = device.type == "cuda" and model_dtype != torch.float32
+    scaler = torch.cuda.amp.GradScaler() if use_amp and model_dtype == torch.float16 else None
+
+    def autocast_context():
+        return torch.autocast(device_type="cuda", dtype=model_dtype) if use_amp else contextlib.nullcontext()
     
     # ==================== Early Stop Initialization ====================
+    best_acc = 0.0           # Record the best accuracy
+    best_epoch = -1          # Record the epoch where best accuracy occurred
+    wait_counter = 0         # Counter for no improvement
     if patience is not None:
-        # Early stop is enabled when patience is provided
-        best_acc = 0.0           # Record the best accuracy
-        best_epoch = -1          # Record the epoch where best accuracy occurred
-        wait_counter = 0         # Counter for no improvement
         print(f"Early stop enabled with patience={patience}")
     else:
         print("Early stop disabled")
     
     # model
     print("Loading model...")
-    model = LaccaseModel(model_path)
+    model = LaccaseModel(model_path, dtype=dtype_name)
     for name, param in model.named_parameters():
         param.requires_grad = False
         for last_layer in range(1, last_layers+1):
@@ -71,7 +78,7 @@ if __name__ == '__main__':
     for name, param in model.named_parameters():
         if param.requires_grad:
             print(name)
-    model = model.cuda()
+    model = model.to(device=device, dtype=model_dtype)
     
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-5)
@@ -84,6 +91,8 @@ if __name__ == '__main__':
                                     collate_fn=test_dataset.collate_fn, drop_last=False, pin_memory=True)
 
     Test_Acc = []
+    ckpt_dir = os.path.join(total_save_path, "ckpt", f"dnn_model_lastlayer{last_layers}")
+    os.makedirs(ckpt_dir, exist_ok=True)
     for epoch in range(EPOCH):
         # ==================== Early Stop Check ====================
         if patience is not None and wait_counter >= patience:
@@ -96,17 +105,21 @@ if __name__ == '__main__':
         print(len(train_dataloader))
         for i, item in enumerate(train_dataloader):
             content, label = item
-            if model.device is not None:
-                label = label.to(model.device)
-            last_result = model(content)
-            loss = criterion(last_result, label)
+            label = label.to(device)
+            with autocast_context():
+                last_result = model(content)
+                loss = criterion(last_result, label)
             print("epoch: {} \t iteration : {} \t Loss: {} \t lr: {}".format(epoch, i, loss.item(),
                                                                              optimizer.param_groups[0]['lr']), flush=True)
             # break
             optimizer.zero_grad()
-            # loss.backward
-            loss.backward()
-            optimizer.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             if i % (len(train_dataloader)//2) == 0:
                 # eval
                 model.eval()
@@ -117,11 +130,11 @@ if __name__ == '__main__':
                 ground_truth_test = {0:len(test_dataset.negative_dataset),1:len(test_dataset.positive_dataset)}
                 for m, test in enumerate(tqdm(test_dataloader)):
                     data_test, label_test = test
-                    if model.device is not None:
-                        label_test = label_test.to(device)
+                    label_test = label_test.to(device)
 
                     with torch.no_grad():
-                        last_result_test = model(data_test).to(device)
+                        with autocast_context():
+                            last_result_test = model(data_test)
 
                     # label
                     predicted = torch.argmax(last_result_test.data, dim=1)
@@ -170,24 +183,56 @@ if __name__ == '__main__':
                 with open(f"{result_dir}/dnn_result_test_ACC_lastlayer{last_layers}.txt", "a+", encoding="utf-8") as output:
                     output.write(str(Test_Acc) + "\n")
                     
-                # ==================== Early Stop Update ====================
-                if patience is not None:
-                    if current_acc > best_acc:
-                        best_acc = current_acc
-                        best_epoch = epoch
-                        wait_counter = 0  # Reset counter
-                        print(f"Test accuracy improved to {best_acc:.4f} at epoch {best_epoch}")
-                    else:
-                        wait_counter += 1
-                        print(f"Test accuracy not improved. Patience: {wait_counter}/{patience}")
+                improved = current_acc > best_acc
+                if improved:
+                    best_acc = current_acc
+                    best_epoch = epoch
+                    wait_counter = 0
+                    best_path = os.path.join(ckpt_dir, "best.pt")
+                    trainable_keys = {n for n, p in model.named_parameters() if p.requires_grad}
+                    trainable_state = {
+                        k: v.detach().cpu()
+                        for k, v in model.state_dict().items()
+                        if k in trainable_keys
+                    }
+                    torch.save(
+                        {
+                            "state_dict": trainable_state,
+                            "meta": {
+                                "base_model": model.base_model,
+                                "last_layers": last_layers,
+                                "repr_dim": model.repr_dim,
+                                "dtype": dtype_name,
+                            },
+                        },
+                        best_path,
+                    )
+                    print(f"Test accuracy improved to {best_acc:.4f} at epoch {best_epoch}")
+                elif patience is not None:
+                    wait_counter += 1
+                    print(f"Test accuracy not improved. Patience: {wait_counter}/{patience}")
                     
                 model.train()
         
         # save model
-        save_path = f"{total_save_path}/ckpt/dnn_model_lastlayer{last_layers}"
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-        torch.save(model.state_dict(), os.path.join(save_path, f"epoch{epoch}.pth"))
+        trainable_keys = {n for n, p in model.named_parameters() if p.requires_grad}
+        trainable_state = {
+            k: v.detach().cpu()
+            for k, v in model.state_dict().items()
+            if k in trainable_keys
+        }
+        torch.save(
+            {
+                "state_dict": trainable_state,
+                "meta": {
+                    "base_model": model.base_model,
+                    "last_layers": last_layers,
+                    "repr_dim": model.repr_dim,
+                    "dtype": dtype_name,
+                },
+            },
+            os.path.join(ckpt_dir, f"epoch{epoch}.pth"),
+        )
         
     # ==================== Final Report ====================
     if patience is not None:
